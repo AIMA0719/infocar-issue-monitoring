@@ -8,112 +8,117 @@ const PORT = 3000;
 
 app.use(express.json());
 
-// Helper function to get the date 7 days ago in YYYY-MM-DD format
-function getOneWeekAgoDate() {
-  const date = new Date();
-  date.setDate(date.getDate() - 7);
-  return date.toISOString().split('T')[0];
-}
-
 app.get('/api/status', async (req, res) => {
+  const debugLog: string[] = [];
+  const log = (msg: string) => {
+    console.log(msg);
+    debugLog.push(msg);
+  };
+
   try {
+    log('API route /api/status started.');
+
     let packageName = process.env.ANDROID_PACKAGE_NAME;
     if (!packageName || packageName === 'com.mureung.obdproject') {
       packageName = 'mureung.obdproject';
     }
+    log(`Package name: ${packageName}`);
 
     let reviewCount = 0;
     let crashCount = 0;
+    let playConsoleRaw: any = null;
+    let ga4Raw: any = null;
 
-    // 1. Get Play Console Reviews (1~2 stars, last 7 days)
-    if (!process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON) {
-      throw new Error('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON environment variable is missing.');
-    }
-
+    // 1. Google Play Console
     try {
-      const credentials = JSON.parse(process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON);
+      const playJsonStr = process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON;
+      if (!playJsonStr) throw new Error('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON is missing.');
+      
+      const playCredentials = JSON.parse(playJsonStr);
+      log('Initializing Google Play API...');
       const auth = new google.auth.GoogleAuth({
-        credentials,
+        credentials: playCredentials,
         scopes: ['https://www.googleapis.com/auth/androidpublisher'],
       });
       const androidpublisher = google.androidpublisher({ version: 'v3', auth });
       
+      log('Fetching reviews...');
       const response = await androidpublisher.reviews.list({
         packageName,
-        maxResults: 100, // Adjust as needed
+        maxResults: 100,
       });
+
+      playConsoleRaw = response.data; // Save raw data
 
       const oneWeekAgo = new Date();
       oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
 
       const reviews = response.data.reviews || [];
-      const badReviews = reviews.filter(review => {
+      const badReviews = reviews.filter((review: any) => {
         const rating = review.comments?.[0]?.userComment?.starRating;
         const lastModified = review.comments?.[0]?.userComment?.lastModified?.seconds;
-        
         if (!rating || !lastModified) return false;
-        
         const reviewDate = new Date(parseInt(lastModified, 10) * 1000);
         return rating <= 2 && reviewDate >= oneWeekAgo;
       });
 
       reviewCount = badReviews.length;
+      log(`Play API success. Bad reviews: ${reviewCount}`);
     } catch (error: any) {
-      console.error('Error fetching Play Console reviews:', error);
-      throw new Error(`Google Play API Error: ${error.message}`);
+      log(`Play API Error: ${error.message}`);
+      playConsoleRaw = { 
+        error: error.message, 
+        code: error.code, 
+        response: error.response?.data || error.response 
+      };
     }
 
-    // 2. Get Crashlytics Data
-    // Firebase Admin SDK does NOT have a direct Crashlytics API.
-    // The most efficient way without BigQuery is to use the Google Analytics Data API 
-    // to query 'app_exception' events, assuming Firebase is linked to GA4.
-    if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-      throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON environment variable is missing.');
-    }
-
-    if (!process.env.GA4_PROPERTY_ID) {
-      throw new Error('GA4_PROPERTY_ID environment variable is missing. (Required to fetch Crashlytics data via GA4)');
-    }
-
+    // 2. GA4 (Crashlytics)
     try {
-      const credentials = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-      const analyticsDataClient = new BetaAnalyticsDataClient({ credentials });
+      const fbJsonStr = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+      if (!fbJsonStr) throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON is missing.');
       
+      const ga4Id = process.env.GA4_PROPERTY_ID;
+      if (!ga4Id) throw new Error('GA4_PROPERTY_ID is missing.');
+
+      const fbCredentials = JSON.parse(fbJsonStr);
+      log('Initializing GA4 API...');
+      const analyticsDataClient = new BetaAnalyticsDataClient({ credentials: fbCredentials });
+      
+      log('Fetching GA4 report...');
       const [response] = await analyticsDataClient.runReport({
-        property: `properties/${process.env.GA4_PROPERTY_ID}`,
-        dateRanges: [
-          {
-            startDate: '7daysAgo',
-            endDate: 'today',
-          },
-        ],
-        metrics: [
-          {
-            name: 'eventCount',
-          },
-        ],
+        property: `properties/${ga4Id}`,
+        dateRanges: [{ startDate: '7daysAgo', endDate: 'today' }],
+        metrics: [{ name: 'eventCount' }],
         dimensionFilter: {
           filter: {
             fieldName: 'eventName',
-            stringFilter: {
-              value: 'app_exception', // Crashlytics logs crashes as app_exception in GA4
-            }
+            stringFilter: { value: 'app_exception' }
           }
         }
       });
 
+      ga4Raw = response; // Save raw data
+
       if (response.rows && response.rows.length > 0) {
         crashCount = parseInt(response.rows[0].metricValues?.[0]?.value || '0', 10);
       }
+      log(`GA4 API success. Crash count: ${crashCount}`);
     } catch (error: any) {
-      console.error('Error fetching GA4 Crash data:', error);
-      throw new Error(`Firebase/GA4 API Error: ${error.message}`);
+      log(`GA4 API Error: ${error.message}`);
+      ga4Raw = { 
+        error: error.message, 
+        code: error.code,
+        details: error.details
+      };
     }
 
-    // 3. Determine Status
     let reviewStatus = '정상';
     let reviewLevel = 'normal';
-    if (reviewCount > 6) {
+    if (playConsoleRaw?.error) {
+      reviewStatus = '조회 실패';
+      reviewLevel = 'warning';
+    } else if (reviewCount > 6) {
       reviewStatus = '위기 (즉시 중단)';
       reviewLevel = 'critical';
     } else if (reviewCount >= 5) {
@@ -123,7 +128,10 @@ app.get('/api/status', async (req, res) => {
 
     let crashStatus = '정상';
     let crashLevel = 'normal';
-    if (crashCount > 1500) {
+    if (ga4Raw?.error) {
+      crashStatus = '조회 실패';
+      crashLevel = 'warning';
+    } else if (crashCount > 1500) {
       crashStatus = '위기 (즉시 중단)';
       crashLevel = 'critical';
     } else if (crashCount >= 1001) {
@@ -131,14 +139,19 @@ app.get('/api/status', async (req, res) => {
       crashLevel = 'warning';
     }
 
-    res.json({
+    res.status(200).json({
       reviews: { count: reviewCount, status: reviewStatus, level: reviewLevel },
       crashes: { count: crashCount, status: crashStatus, level: crashLevel },
-      updatedAt: new Date().toISOString()
+      updatedAt: new Date().toISOString(),
+      debugLog,
+      rawData: {
+        playConsole: playConsoleRaw,
+        ga4: ga4Raw
+      }
     });
   } catch (error: any) {
-    console.error('API Error:', error);
-    res.status(500).json({ error: error.message });
+    log(`FATAL ERROR: ${error.message}`);
+    res.status(500).json({ error: error.message, debugLog });
   }
 });
 

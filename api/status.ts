@@ -15,83 +15,147 @@ export default async function handler(req: any, res: any) {
   try {
     log('API route /api/status started.');
 
+    // Query parameters
+    const rangeDays = parseInt(req.query.range || '7', 10);
+    const compareType = req.query.compare || 'week'; // 'day' or 'week'
+
     let packageName = process.env.ANDROID_PACKAGE_NAME;
-    // 사용자가 com.mureung.obdproject로 설정했더라도 mureung.obdproject로 강제 변환하여 테스트
     if (!packageName || packageName === 'com.mureung.obdproject') {
       packageName = 'mureung.obdproject';
     }
-    log(`Package name: ${packageName}`);
+    log(`Package name: ${packageName}, Range: ${rangeDays} days, Compare: ${compareType}`);
 
-    const playJsonStr = process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON;
-    if (!playJsonStr) throw new Error('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON is missing.');
-    log(`Play JSON length: ${playJsonStr.length}`);
+    let playConsoleRaw: any = null;
+    let ga4Raw: any = null;
 
-    const fbJsonStr = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-    if (!fbJsonStr) throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON is missing.');
-    log(`Firebase JSON length: ${fbJsonStr.length}`);
+    // --- 1. Google Play Console (Reviews) ---
+    let currentReviews: any[] = [];
+    let previousReviews: any[] = [];
+    let currentAvg = 0;
+    let previousAvg = 0;
+    let reviewTexts: any[] = [];
+    
+    let playAuth: any = null;
 
-    const ga4Id = process.env.GA4_PROPERTY_ID;
-    if (!ga4Id) throw new Error('GA4_PROPERTY_ID is missing.');
-    log(`GA4 Property ID: ${ga4Id}`);
-
-    let playCredentials;
     try {
-      playCredentials = JSON.parse(playJsonStr);
-      log('Play JSON parsed successfully.');
-    } catch (e: any) {
-      throw new Error(`Failed to parse GOOGLE_PLAY_SERVICE_ACCOUNT_JSON. Is it valid JSON? Error: ${e.message}`);
-    }
-
-    let fbCredentials;
-    try {
-      fbCredentials = JSON.parse(fbJsonStr);
-      log('Firebase JSON parsed successfully.');
-    } catch (e: any) {
-      throw new Error(`Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON. Is it valid JSON? Error: ${e.message}`);
-    }
-
-    let reviewCount = 0;
-    try {
-      log('Initializing Google Play API...');
-      const auth = new google.auth.GoogleAuth({
+      const playJsonStr = process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON;
+      if (!playJsonStr) throw new Error('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON is missing.');
+      
+      const playCredentials = JSON.parse(playJsonStr);
+      playAuth = new google.auth.GoogleAuth({
         credentials: playCredentials,
         scopes: ['https://www.googleapis.com/auth/androidpublisher'],
       });
-      const androidpublisher = google.androidpublisher({ version: 'v3', auth });
+      
+      const androidpublisher = google.androidpublisher({ version: 'v3', auth: playAuth });
       
       log('Fetching reviews...');
       const response = await androidpublisher.reviews.list({
         packageName,
-        maxResults: 100,
+        maxResults: 100, // Fetching max to do local filtering
       });
 
-      const oneWeekAgo = new Date();
-      oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+      playConsoleRaw = response.data;
 
-      const reviews = response.data.reviews || [];
-      const badReviews = reviews.filter((review: any) => {
-        const rating = review.comments?.[0]?.userComment?.starRating;
-        const lastModified = review.comments?.[0]?.userComment?.lastModified?.seconds;
-        if (!rating || !lastModified) return false;
+      const now = new Date();
+      const currentPeriodStart = new Date();
+      currentPeriodStart.setDate(now.getDate() - rangeDays);
+
+      const previousPeriodStart = new Date(currentPeriodStart);
+      if (compareType === 'day') {
+        previousPeriodStart.setDate(previousPeriodStart.getDate() - rangeDays);
+      } else {
+        // week
+        previousPeriodStart.setDate(previousPeriodStart.getDate() - 7);
+      }
+
+      const allReviews = response.data.reviews || [];
+      
+      allReviews.forEach((review: any) => {
+        const comment = review.comments?.[0]?.userComment;
+        if (!comment) return;
+        
+        const rating = comment.starRating;
+        const text = comment.text?.trim() || '';
+        const lastModified = comment.lastModified?.seconds;
+        if (!rating || !lastModified) return;
+        
         const reviewDate = new Date(parseInt(lastModified, 10) * 1000);
-        return rating <= 2 && reviewDate >= oneWeekAgo;
+
+        if (reviewDate >= currentPeriodStart && reviewDate <= now) {
+          currentReviews.push(rating);
+          if (text) {
+            reviewTexts.push({
+              id: review.reviewId,
+              rating,
+              text,
+              date: reviewDate.toISOString(),
+              author: review.authorName || 'Anonymous'
+            });
+          }
+        } else if (reviewDate >= previousPeriodStart && reviewDate < currentPeriodStart) {
+          previousReviews.push(rating);
+        }
       });
 
-      reviewCount = badReviews.length;
-      log(`Play API success. Bad reviews: ${reviewCount}`);
+      currentAvg = currentReviews.length > 0 
+        ? currentReviews.reduce((a, b) => a + b, 0) / currentReviews.length 
+        : 0;
+      
+      previousAvg = previousReviews.length > 0 
+        ? previousReviews.reduce((a, b) => a + b, 0) / previousReviews.length 
+        : 0;
+
+      // Sort reviews by date descending
+      reviewTexts.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+      log(`Play API success. Current Avg: ${currentAvg.toFixed(2)}, Prev Avg: ${previousAvg.toFixed(2)}`);
+
     } catch (error: any) {
-      throw new Error(`Google Play API Error: ${error.message}`);
+      log(`Play API Error: ${error.message}`);
+      playConsoleRaw = { error: error.message };
     }
 
+    // --- 1-B. Google Play Developer Reporting API (Vitals / Detailed Bugs) ---
+    let vitalsRaw: any = null;
+    let vitalsIssues: any[] = [];
+    
+    if (playAuth) {
+      try {
+        log('Initializing Play Developer Reporting API (Vitals)...');
+        const reporting = google.playdeveloperreporting({ version: 'v1beta1', auth: playAuth });
+        const vitalsRes = await reporting.vitals.errors.issues.search({
+          parent: `apps/${packageName}`,
+          pageSize: 15,
+        });
+        vitalsRaw = vitalsRes.data;
+        vitalsIssues = vitalsRes.data.errorIssues || [];
+        log(`Vitals API success. Found ${vitalsIssues.length} issues.`);
+      } catch (e: any) {
+        log(`Vitals API Error: ${e.message}`);
+        vitalsRaw = { error: e.message };
+      }
+    } else {
+      vitalsRaw = { error: 'Play Console Auth failed, skipping Vitals API.' };
+    }
+
+    // --- 2. GA4 (Crashlytics) ---
     let crashCount = 0;
+    let crashVersions: any[] = [];
     try {
-      log('Initializing GA4 API...');
+      const fbJsonStr = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+      if (!fbJsonStr) throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON is missing.');
+      
+      const ga4Id = process.env.GA4_PROPERTY_ID;
+      if (!ga4Id) throw new Error('GA4_PROPERTY_ID is missing.');
+
+      const fbCredentials = JSON.parse(fbJsonStr);
       const analyticsDataClient = new BetaAnalyticsDataClient({ credentials: fbCredentials });
       
-      log('Fetching GA4 report...');
       const [response] = await analyticsDataClient.runReport({
         property: `properties/${ga4Id}`,
-        dateRanges: [{ startDate: '7daysAgo', endDate: 'today' }],
+        dateRanges: [{ startDate: `${rangeDays}daysAgo`, endDate: 'today' }],
+        dimensions: [{ name: 'appVersion' }],
         metrics: [{ name: 'eventCount' }],
         dimensionFilter: {
           filter: {
@@ -101,27 +165,44 @@ export default async function handler(req: any, res: any) {
         }
       });
 
+      ga4Raw = response;
       if (response.rows && response.rows.length > 0) {
-        crashCount = parseInt(response.rows[0].metricValues?.[0]?.value || '0', 10);
+        crashVersions = response.rows.map((row: any) => ({
+          version: row.dimensionValues?.[0]?.value || 'Unknown',
+          count: parseInt(row.metricValues?.[0]?.value || '0', 10)
+        })).sort((a: any, b: any) => b.count - a.count);
+        
+        crashCount = crashVersions.reduce((sum, v) => sum + v.count, 0);
       }
       log(`GA4 API success. Crash count: ${crashCount}`);
     } catch (error: any) {
-      throw new Error(`Firebase/GA4 API Error: ${error.message}`);
+      log(`GA4 API Error: ${error.message}`);
+      ga4Raw = { error: error.message };
     }
 
+    // --- 3. Determine Status ---
+    // Count 1~2 star reviews in current period for status
+    const badReviewCount = currentReviews.filter(r => r <= 2).length;
+    
     let reviewStatus = '정상';
     let reviewLevel = 'normal';
-    if (reviewCount > 6) {
+    if (playConsoleRaw?.error) {
+      reviewStatus = '조회 실패';
+      reviewLevel = 'warning';
+    } else if (badReviewCount > 6) {
       reviewStatus = '위기 (즉시 중단)';
       reviewLevel = 'critical';
-    } else if (reviewCount >= 5) {
+    } else if (badReviewCount >= 5) {
       reviewStatus = '주의 (내부 공유)';
       reviewLevel = 'warning';
     }
 
     let crashStatus = '정상';
     let crashLevel = 'normal';
-    if (crashCount > 1500) {
+    if (ga4Raw?.error) {
+      crashStatus = '조회 실패';
+      crashLevel = 'warning';
+    } else if (crashCount > 1500) {
       crashStatus = '위기 (즉시 중단)';
       crashLevel = 'critical';
     } else if (crashCount >= 1001) {
@@ -130,10 +211,24 @@ export default async function handler(req: any, res: any) {
     }
 
     res.status(200).json({
-      reviews: { count: reviewCount, status: reviewStatus, level: reviewLevel },
-      crashes: { count: crashCount, status: crashStatus, level: crashLevel },
+      reviews: { 
+        count: badReviewCount, 
+        status: reviewStatus, 
+        level: reviewLevel,
+        average: currentAvg,
+        previousAverage: previousAvg,
+        texts: reviewTexts
+      },
+      crashes: { 
+        count: crashCount, 
+        status: crashStatus, 
+        level: crashLevel,
+        versions: crashVersions,
+        vitals: vitalsIssues
+      },
       updatedAt: new Date().toISOString(),
-      debugLog
+      debugLog,
+      rawData: { playConsole: playConsoleRaw, ga4: ga4Raw, vitals: vitalsRaw }
     });
   } catch (error: any) {
     log(`FATAL ERROR: ${error.message}`);
