@@ -17,9 +17,9 @@ function getOneWeekAgoDate() {
 
 app.get('/api/status', async (req, res) => {
   try {
-    const packageName = process.env.ANDROID_PACKAGE_NAME;
-    if (!packageName) {
-      throw new Error('ANDROID_PACKAGE_NAME environment variable is missing.');
+    let packageName = process.env.ANDROID_PACKAGE_NAME;
+    if (!packageName || packageName === 'com.mureung.obdproject') {
+      packageName = 'mureung.obdproject';
     }
 
     let reviewCount = 0;

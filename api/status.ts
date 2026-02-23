@@ -15,8 +15,11 @@ export default async function handler(req: any, res: any) {
   try {
     log('API route /api/status started.');
 
-    const packageName = process.env.ANDROID_PACKAGE_NAME;
-    if (!packageName) throw new Error('ANDROID_PACKAGE_NAME is missing.');
+    let packageName = process.env.ANDROID_PACKAGE_NAME;
+    // 사용자가 com.mureung.obdproject로 설정했더라도 mureung.obdproject로 강제 변환하여 테스트
+    if (!packageName || packageName === 'com.mureung.obdproject') {
+      packageName = 'mureung.obdproject';
+    }
     log(`Package name: ${packageName}`);
 
     const playJsonStr = process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON;
