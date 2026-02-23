@@ -1,0 +1,5 @@
+{
+  "name": "Android Release Monitor",
+  "description": "Monitors Android app deployment status using Google Play Console and Firebase Crashlytics data.",
+  "requestFramePermissions": []
+}
