@@ -16,23 +16,37 @@ interface DashboardData {
   reviews: MetricData;
   crashes: MetricData;
   updatedAt: string;
+  debugLog?: string[];
 }
 
 export default function App() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [debugLog, setDebugLog] = useState<string[]>([]);
 
   const fetchData = async () => {
     setLoading(true);
     setError(null);
+    setDebugLog([]);
     try {
       const response = await fetch('/api/status');
+      const contentType = response.headers.get('content-type');
+      
       if (!response.ok) {
-        throw new Error('Failed to fetch data');
+        if (contentType && contentType.includes('application/json')) {
+          const errData = await response.json();
+          if (errData.debugLog) setDebugLog(errData.debugLog);
+          throw new Error(errData.error || `HTTP Error ${response.status}`);
+        } else {
+          const textData = await response.text();
+          throw new Error(`Server returned non-JSON (${response.status}): ${textData.substring(0, 150)}...`);
+        }
       }
+      
       const result = await response.json();
       setData(result);
+      if (result.debugLog) setDebugLog(result.debugLog);
     } catch (err: any) {
       setError(err.message);
     } finally {
@@ -95,9 +109,18 @@ export default function App() {
         {error && (
           <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-xl text-red-700 text-sm flex items-start">
             <AlertTriangle className="w-5 h-5 mr-3 shrink-0 mt-0.5" />
-            <div>
+            <div className="flex-1">
               <p className="font-medium">Error loading data</p>
               <p className="mt-1 opacity-90">{error}</p>
+              
+              {debugLog.length > 0 && (
+                <div className="mt-4 p-3 bg-red-900/10 rounded-lg font-mono text-xs overflow-x-auto">
+                  <p className="font-semibold mb-2">Debug Log:</p>
+                  {debugLog.map((log, i) => (
+                    <div key={i} className="mb-1">{log}</div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         )}

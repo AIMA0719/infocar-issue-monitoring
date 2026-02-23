@@ -6,31 +6,60 @@ export default async function handler(req: any, res: any) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
+  const debugLog: string[] = [];
+  const log = (msg: string) => {
+    console.log(msg);
+    debugLog.push(msg);
+  };
+
   try {
+    log('API route /api/status started.');
+
     const packageName = process.env.ANDROID_PACKAGE_NAME;
-    if (!packageName) {
-      throw new Error('ANDROID_PACKAGE_NAME environment variable is missing.');
+    if (!packageName) throw new Error('ANDROID_PACKAGE_NAME is missing.');
+    log(`Package name: ${packageName}`);
+
+    const playJsonStr = process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON;
+    if (!playJsonStr) throw new Error('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON is missing.');
+    log(`Play JSON length: ${playJsonStr.length}`);
+
+    const fbJsonStr = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+    if (!fbJsonStr) throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON is missing.');
+    log(`Firebase JSON length: ${fbJsonStr.length}`);
+
+    const ga4Id = process.env.GA4_PROPERTY_ID;
+    if (!ga4Id) throw new Error('GA4_PROPERTY_ID is missing.');
+    log(`GA4 Property ID: ${ga4Id}`);
+
+    let playCredentials;
+    try {
+      playCredentials = JSON.parse(playJsonStr);
+      log('Play JSON parsed successfully.');
+    } catch (e: any) {
+      throw new Error(`Failed to parse GOOGLE_PLAY_SERVICE_ACCOUNT_JSON. Is it valid JSON? Error: ${e.message}`);
+    }
+
+    let fbCredentials;
+    try {
+      fbCredentials = JSON.parse(fbJsonStr);
+      log('Firebase JSON parsed successfully.');
+    } catch (e: any) {
+      throw new Error(`Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON. Is it valid JSON? Error: ${e.message}`);
     }
 
     let reviewCount = 0;
-    let crashCount = 0;
-
-    // 1. Get Play Console Reviews (1~2 stars, last 7 days)
-    if (!process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON) {
-      throw new Error('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON environment variable is missing.');
-    }
-
     try {
-      const credentials = JSON.parse(process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON);
+      log('Initializing Google Play API...');
       const auth = new google.auth.GoogleAuth({
-        credentials,
+        credentials: playCredentials,
         scopes: ['https://www.googleapis.com/auth/androidpublisher'],
       });
       const androidpublisher = google.androidpublisher({ version: 'v3', auth });
       
+      log('Fetching reviews...');
       const response = await androidpublisher.reviews.list({
         packageName,
-        maxResults: 100, // Adjust as needed
+        maxResults: 100,
       });
 
       const oneWeekAgo = new Date();
@@ -40,51 +69,31 @@ export default async function handler(req: any, res: any) {
       const badReviews = reviews.filter((review: any) => {
         const rating = review.comments?.[0]?.userComment?.starRating;
         const lastModified = review.comments?.[0]?.userComment?.lastModified?.seconds;
-        
         if (!rating || !lastModified) return false;
-        
         const reviewDate = new Date(parseInt(lastModified, 10) * 1000);
         return rating <= 2 && reviewDate >= oneWeekAgo;
       });
 
       reviewCount = badReviews.length;
+      log(`Play API success. Bad reviews: ${reviewCount}`);
     } catch (error: any) {
-      console.error('Error fetching Play Console reviews:', error);
       throw new Error(`Google Play API Error: ${error.message}`);
     }
 
-    // 2. Get Crashlytics Data
-    if (!process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-      throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON environment variable is missing.');
-    }
-
-    if (!process.env.GA4_PROPERTY_ID) {
-      throw new Error('GA4_PROPERTY_ID environment variable is missing. (Required to fetch Crashlytics data via GA4)');
-    }
-
+    let crashCount = 0;
     try {
-      const credentials = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-      const analyticsDataClient = new BetaAnalyticsDataClient({ credentials });
+      log('Initializing GA4 API...');
+      const analyticsDataClient = new BetaAnalyticsDataClient({ credentials: fbCredentials });
       
+      log('Fetching GA4 report...');
       const [response] = await analyticsDataClient.runReport({
-        property: `properties/${process.env.GA4_PROPERTY_ID}`,
-        dateRanges: [
-          {
-            startDate: '7daysAgo',
-            endDate: 'today',
-          },
-        ],
-        metrics: [
-          {
-            name: 'eventCount',
-          },
-        ],
+        property: `properties/${ga4Id}`,
+        dateRanges: [{ startDate: '7daysAgo', endDate: 'today' }],
+        metrics: [{ name: 'eventCount' }],
         dimensionFilter: {
           filter: {
             fieldName: 'eventName',
-            stringFilter: {
-              value: 'app_exception', // Crashlytics logs crashes as app_exception in GA4
-            }
+            stringFilter: { value: 'app_exception' }
           }
         }
       });
@@ -92,12 +101,11 @@ export default async function handler(req: any, res: any) {
       if (response.rows && response.rows.length > 0) {
         crashCount = parseInt(response.rows[0].metricValues?.[0]?.value || '0', 10);
       }
+      log(`GA4 API success. Crash count: ${crashCount}`);
     } catch (error: any) {
-      console.error('Error fetching GA4 Crash data:', error);
       throw new Error(`Firebase/GA4 API Error: ${error.message}`);
     }
 
-    // 3. Determine Status
     let reviewStatus = '정상';
     let reviewLevel = 'normal';
     if (reviewCount > 6) {
@@ -121,10 +129,11 @@ export default async function handler(req: any, res: any) {
     res.status(200).json({
       reviews: { count: reviewCount, status: reviewStatus, level: reviewLevel },
       crashes: { count: crashCount, status: crashStatus, level: crashLevel },
-      updatedAt: new Date().toISOString()
+      updatedAt: new Date().toISOString(),
+      debugLog
     });
   } catch (error: any) {
-    console.error('API Error:', error);
-    res.status(500).json({ error: error.message });
+    log(`FATAL ERROR: ${error.message}`);
+    res.status(500).json({ error: error.message, debugLog });
   }
 }
